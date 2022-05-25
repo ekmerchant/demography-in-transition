@@ -1,0 +1,340 @@
+---
+title: "Code for U.S. Demography in Transition, published in Historical Methods"
+author: "Emily Merchant and Carrie Alexander, with assistance from Lily Hallmark"
+date: "5.25.2022"
+output: html_notebook
+---
+
+
+
+```{r}
+#Create folders for output
+system("mkdir working")
+system("mkdir tables-and-figures")
+
+```
+
+Packages
+```{r}
+library(tidyverse)
+library(tidytext)
+library(textstem)
+library(lubridate)
+library(quanteda)
+library(stm)
+library(wordcloud)
+library(RColorBrewer)
+```
+
+
+## 1. Document Preparation
+```{r}
+#Read in interview text and add document ID.
+paa_text <- read.csv("interview_text.csv") %>% 
+                mutate(utterance = str_remove(utterance, "^: ")) %>%
+                mutate(document = str_c(filename, row_number()))
+
+#Tokenize, remove standard stop words, convert to lowercase, remove digits and punctuation.
+paa_words <- paa_text %>% 
+                unnest_tokens(word, utterance) %>% 
+                anti_join(stop_words) %>% 
+                filter(!str_detect(word,"[:digit:]"))
+
+#Lemmatize.
+paa_lemmas <- tibble(word = unique(paa_words$word))
+paa_lemmas$lemma <- lemmatize_words(paa_lemmas$word)
+paa_words <- left_join(paa_words, paa_lemmas) 
+
+#Remove words that only occur once and remove documents with fewer than ten words.
+lemmas <- paa_words %>% count(lemma) %>% 
+            filter(!str_detect(lemma, "_") & 
+                   !str_detect(lemma, "[0-9]") & n > 1) 
+paa_words <- paa_words %>% filter(lemma %in% lemmas$lemma)
+nwords <- paa_words %>% group_by(document) %>% tally() %>% filter(n > 9)
+paa_words <- paa_words %>% filter(document %in% nwords$document)
+length(unique(paa_words$lemma))
+
+
+#Cast document feature matrix (dfm).
+paa_dfm <- paa_words %>% group_by(document) %>% 
+              count(lemma) %>% cast_dfm(document, lemma, n)
+
+#Save
+saveRDS(paa_dfm, "working/paa_dfm.RDS")
+```
+## 2. Metadata
+```{r}
+#Make a table of utterance-level metadata, centering interview year on the median.
+metadata <- read_csv("interview_metadata.csv") %>%
+              mutate(int_year = year(interview_date))
+median_interview <- median(metadata$int_year)
+
+paa_meta <- tibble(document = unique(paa_words$document)) %>% 
+              left_join(select(paa_text, document, role)) %>%
+              mutate(filename = str_extract(document, ".+xml")) %>%
+              left_join(metadata, 
+                        by = "filename") %>%
+              mutate(int_c = int_year - median_interview)
+
+saveRDS(paa_meta, "working/paa_meta.RDS")
+```
+## 3. Structural Topic Modeling
+Test models with 15-40 topics.
+```{r}
+corpus <- convert(readRDS("working/paa_dfm.RDS"), to = "stm")
+kResult <- searchK(documents = corpus$documents, vocab = corpus$vocab,
+                   K = 15:40, prevalence = ~int_c,
+                   data = readRDS("working/paa_meta.RDS"))
+saveRDS(kResult, "working/kResult_15_40.RDS")
+```
+Graph the exclusivity/semantic coherence tradeoff.
+```{r}
+kSearch <- readRDS("working/kResult_15_40.RDS")
+semcoh <- kSearch$results$semcoh %>% unlist()
+exclus <- kSearch$results$exclus %>% unlist()
+k <- kSearch$results$K %>% unlist()
+
+data.frame(k, semcoh, exclus) %>% ggplot(aes(semcoh, exclus, color = factor(k))) + geom_point()
+```
+Run models with 17-19 topics.
+```{r}
+model_topics <- function(ntopics) {
+  model <- stm(documents = readRDS("working/paa_dfm.RDS"),
+               K = ntopics, init.type = "Spectral",
+               prevalence = ~ int_c,
+               data = readRDS("working/paa_meta.RDS"))
+  saveRDS(model, str_c("working/model_", ntopics, ".RDS"))
+}
+
+model_topics(17)
+model_topics(18)
+model_topics(19)
+
+```
+
+## 4. Model Selection
+For each model, label topics with most probable words and most unique words
+```{r}
+make_labels <- function(model, topics) {
+  labels <- labelTopics(model, 1:topics)
+  prob <- as_tibble(labels$prob) %>% 
+            mutate(prob_words = str_c(V1, V2, V3, V4, V5, V6, V7, sep = ", "),
+                   topic = row_number()) %>%
+            select(topic, prob_words)
+  frex <- as_tibble(labels$frex) %>% 
+            mutate(frex_words = str_c(V1, V2, V3, V4, V5, V6, V7, sep = ", "),
+                   topic = row_number()) %>%
+            select(topic, frex_words)
+  return <- inner_join(prob, frex)
+}
+
+labels_17 <- make_labels(readRDS("working/model_17.RDS"), 17)
+labels_18 <- make_labels(readRDS("working/model_18.RDS"), 18)
+labels_19 <- make_labels(readRDS("working/model_19.RDS"), 19)
+```
+For each model, make word clouds to visualize the top 100 words in each topic and list the ten most representative utterances for each topic.
+```{r}
+for (k in 17:19) {
+  system(str_c("mkdir working/", k, "-topics"))
+  
+  #word clouds
+  n <- 100 #number of words per cloud
+  topic_words <- tidy(readRDS(str_c("working/model_", k, ".RDS")), matrix = "beta")
+  palette <- "Blues"
+  pal <- rep(brewer.pal(9, palette), each = ceiling(n / 9))[n:1]
+  for(i in 1:length(unique(topic_words$topic))) {
+    topic <- topic_words %>% filter(topic == i) %>% arrange(-beta)
+    png(str_c("working/", k, "-topics/t_", i, ".png"), 
+        height = 5, width = 5, units = "in", res = 200)
+      wordcloud(words = topic[1:n, ]$term, freq = topic[1:n, ]$beta, 
+                        random.order = FALSE, ordered.colors = TRUE, colors = pal)
+      title(str_c("Topic ", i))
+    dev.off()
+  }
+  
+  #utterances
+  meta <- readRDS("working/paa_meta.RDS") %>% 
+            mutate(row = row_number()) %>% select(row, doc = document, filename, role)
+  text <- read.csv("interview_text.csv") %>% 
+                mutate(utterance = str_remove(utterance, "^: ")) %>%
+                mutate(doc = str_c(filename, row_number())) %>% select(doc, utterance)
+  topic_docs <- tidy(readRDS(str_c("working/model_", k, ".RDS")), matrix = "theta") %>% 
+                  left_join(meta, by = c("document" = "row")) %>% left_join(text)
+
+  for (i in 1:length(unique(topic_docs$topic))) {
+    topic <- topic_docs %>% filter(topic == i) %>% 
+                arrange(-gamma) %>% top_n(10, gamma)
+    out <- str_c("working/", k, "-topics/t_", i, ".txt")
+    if(file.exists(out)) {file.remove(out)}
+    file(out)
+      for (j in 1:nrow(topic)) {
+        write(topic[j, ]$filename, out, append = TRUE)
+        write(topic[j, ]$role, out, append = TRUE)
+        write(topic[j, ]$gamma, out, append = TRUE)
+        write(topic[j, ]$utterance, out, append = TRUE)
+        write(" ", out, append = TRUE)
+      }
+    close(file(out))
+  }
+}
+
+
+```
+
+## 5. Table and Figures for 18-topic Model
+### Table 1
+```{r}
+short_labels <- tribble(~topic, ~label,
+                        1, "PAA Meetings",
+                        2, "Graduate Training",
+                        3, "Work-Life Balance",
+                        4, "PAA Politics",
+                        5, "Social Demography",
+                        6, "PAA Business",
+                        7, "Population Problems",
+                        8, "State of the Field",
+                        9, "Funding for Demography",
+                        10, "Official Statistics",
+                        11, "PAA History",
+                        12, "Government Careers",
+                        13, "Academic Careers",
+                        14, "Fertility",
+                        15, "Survey Research",
+                        16, "Early Education",
+                        17, "International Experiences",
+                        18, "Publishing")
+
+long_labels <- labelTopics(readRDS("working/model_18.RDS"), 1:18)
+  prob <- as_tibble(long_labels$prob) %>% 
+            mutate(prob_words = str_c(V1, V2, V3, V4, V5, V6, V7, sep = ", "),
+                   topic = row_number()) %>%
+            select(topic, prob_words)
+  frex <- as_tibble(long_labels$frex) %>% 
+            mutate(frex_words = str_c(V1, V2, V3, V4, V5, V6, V7, sep = ", "),
+                   topic = row_number()) %>%
+            select(topic, frex_words)
+labels <- inner_join(prob, frex) %>% inner_join(short_labels)
+
+#Recover word assignments from model and calculate topic prevalence.
+assignments <- augment(readRDS("working/model_18.RDS"), 
+                       data = readRDS("working/paa_dfm.RDS")) %>% 
+                  rename(topic = ".topic") %>%
+                  left_join(readRDS("working/paa_meta.RDS"))
+prevalence <- assignments %>% mutate(period = ifelse(int_year < 1980, "p1",
+                                              ifelse(int_year < 2000, "p2", "p3"))) %>%
+                group_by(topic, period) %>% summarize(topic_period = sum(count)) %>% 
+                ungroup() %>% group_by(period) %>% 
+                mutate(period_pct = topic_period/sum(topic_period)) %>% ungroup() %>%
+                group_by(topic) %>% mutate(topic_words = sum(topic_period)) %>% ungroup() %>%
+                pivot_wider(id_cols = c(topic, topic_words), 
+                            names_from = period, values_from = period_pct) %>%
+                mutate(topic_pct = topic_words/sum(topic_words)) %>% left_join(labels) %>% 
+                         select(topic, label, prob_words, frex_words, topic_pct, p1, p2, p3) %>%
+                arrange(-topic_pct)
+#Test
+sum(prevalence$topic_pct)
+sum(prevalence$p1)
+sum(prevalence$p2)
+sum(prevalence$p3)
+
+write_csv(prevalence, "tables-and-figures/table1.csv")
+```
+
+### Figure 1
+```{r}
+#Get word assignments from model
+assignments <- augment(readRDS("working/model_18.RDS"), 
+                       data = readRDS("working/paa_dfm.RDS")) %>% 
+                  rename(topic = ".topic") %>%
+                  left_join(readRDS("working/paa_meta.RDS"))
+#Aggregate words to interview level
+interview <- assignments %>% group_by(filename, int_year, topic) %>% 
+                summarize(topic_n = sum(count)) %>% ungroup() %>% 
+                group_by(filename) %>% mutate(pct = topic_n/sum(topic_n)) %>% ungroup()
+#Produce figure
+tiff("tables-and-figures/Figure1.tiff", 
+     width = 7, height = 10, units = "in", res = 600)
+  prevalence %>% select(topic, topic_pct, label) %>%
+    right_join(select(interview, topic, int_year, pct)) %>%
+    ggplot(aes(x = int_year, y = pct)) + geom_smooth(alpha = .75, color = "black") + 
+    facet_wrap(vars(reorder(label, -topic_pct)), ncol = 3) +
+    scale_y_continuous(breaks = seq(0, 0.3, 0.1)) +
+    scale_x_continuous(breaks = c(1980, 1995, 2010)) +
+    theme_minimal(base_size = 10) +
+    labs(x = "Interview Year", y = "Topic Proportion")
+dev.off()
+```
+
+### Figure 2
+```{r}
+#Estimate coefficients
+effects <- estimateEffect(1:18 ~ int_c, 
+               stmobj = readRDS("working/model_18.RDS"),
+               metadata = readRDS("working/paa_meta.RDS"), uncertainty = "Global")
+
+coeffs <- tibble()
+for (i in 1:17) {
+  summ <- summary(effects, topics = i)
+  results <- unlist(summ$tables)
+  est <- results[2]
+  err <- results[4]
+  p <- results[8]
+  topic <- i
+  row <- tibble(topic, est, err, p)
+  coeffs <- rbind(coeffs, row)
+}
+
+coeffs <- left_join(coeffs, prevalence) %>% mutate(color = ifelse(p < .05, "black", "gray"))
+
+#Graph coefficients.
+tiff("tables-and-figures/Figure2.tiff", 
+    width = 10, height = 5, units = "in", res = 600)
+    coeffs %>% ggplot(aes(x = reorder(label, -est), y = est, color = color)) + 
+      geom_point(aes(size = topic_pct*5)) + coord_flip() +
+      geom_errorbar(aes(ymin = est - err, ymax = est + err, color = color)) +
+      scale_color_identity() +
+      theme_minimal(base_size = 10) + theme(legend.position = "none") +
+      labs(y = "Effect of interview year on topic prevalence", x = "Topic")
+dev.off()
+
+```
+
+
+
+### Figure 3
+```{r}
+#Read in interview text.
+text <- read.csv("interview_text.csv") %>% group_by(filename) %>%
+            summarize(interview = str_c(utterance, collapse = " ")) %>% 
+            right_join(read_csv("interview_metadata.csv"))
+
+#List of ngrams to find
+wordlist <- list(c("population council", "ford foundation", 
+                   "rockefeller foundation", "milbank memorial"),
+                 c("nih", "nia", "nichd"))
+
+#Calculate prevalence of each set of ngrams
+graphdata <- tibble()
+for (i in seq_along(wordlist)) {
+  nwords <- str_count(wordlist[[i]][1], " ") + 1
+  rows <- text %>% unnest_tokens(gram, interview, token = "ngrams", n = nwords) %>%
+              mutate(ngram = ifelse(gram %in% wordlist[[i]], 
+                                    str_c(wordlist[[i]], collapse = ", "), 
+                                    "other")) %>%
+              group_by(filename, interview_date) %>% count(ngram) %>% 
+              mutate(freq = n/sum(n)) %>%
+              filter(ngram != "other") %>% select(-n)
+  graphdata <- rbind(graphdata, rows)
+}
+
+#Graph ngram prevalence
+tiff("tables-and-figures/Figure3.tiff", 
+          width = 10, height = 5, units = "in", res = 600)  
+  ggplot(graphdata, aes(x = interview_date, y = freq, color = ngram)) + 
+    geom_smooth(method = "lm", formula = y ~ x, alpha = .25) +
+    scale_y_continuous(labels = scales::percent) +
+    scale_color_manual(values = c("black", "gray")) +
+    theme_minimal() + theme(legend.position = "bottom") +
+    labs(x = "Interview Date", y = "Percent of N-Grams")
+dev.off()
+```
